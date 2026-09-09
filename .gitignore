@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Ambiente
+.env
+
+# Bilhetes enviados
+storage/tickets/*
+!storage/tickets/.gitkeep
+
+# Ferramentas
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.sqlite3
