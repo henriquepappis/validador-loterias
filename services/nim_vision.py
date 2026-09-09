@@ -19,7 +19,10 @@ from services.lottery import clean_numbers, normalize_lottery_type, validate_num
 
 _EXTRACTION_PROMPT = """
 Você é um extrator de dados de comprovantes de loteria da Caixa Econômica
-Federal (apenas Mega-Sena e Quina). A imagem pode conter VÁRIOS comprovantes.
+Federal (apenas Mega-Sena e Quina). A imagem pode conter VÁRIOS comprovantes,
+e cada comprovante pode ter VÁRIAS apostas (sequências de dezenas marcadas).
+
+Agrupe as apostas por MODALIDADE e NÚMERO DO CONCURSO.
 
 Devolva ESTRITAMENTE um JSON válido, sem markdown e sem qualquer texto fora do
 JSON, no formato:
@@ -30,14 +33,15 @@ JSON, no formato:
       "lottery_type": "Mega-Sena" | "Quina",
       "draw_number": <inteiro do concurso>,
       "games": [
-        { "identifier": "A", "numbers": [<inteiros das dezenas apostadas>] }
+        { "numbers": [<inteiros das dezenas de uma aposta>] }
       ]
     }
   ]
 }
 
 Regras:
-- Um item em "tickets" para CADA comprovante distinto visível na imagem.
+- Um item em "tickets" para cada par (modalidade, concurso) DISTINTO na imagem.
+- Em "games", liste TODAS as apostas daquele concurso, sem repetir nenhuma.
 - "numbers" são inteiros, sem zero à esquerda (4, não "04") e sem sufixos.
 - Mega-Sena: dezenas de 1 a 60. Quina: dezenas de 1 a 80.
 - Não invente dados. Se uma dezena estiver ilegível, omita-a.

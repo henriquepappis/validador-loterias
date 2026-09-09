@@ -84,12 +84,17 @@ def _load_batch(db: Session, batch_id: int) -> Batch | None:
 
 _TICKET_FIELD_RE = re.compile(r"^image_(\d+)_ticket_([0-9a-z]+)_(lottery|draw)$")
 _GAME_FIELD_RE = re.compile(
-    r"^image_(\d+)_ticket_([0-9a-z]+)_game_([0-9a-z]+)_(id|numbers)$"
+    r"^image_(\d+)_ticket_([0-9a-z]+)_game_([0-9a-z]+)_numbers$"
 )
 
 
 def _parse_revisar_form(form) -> dict[int, dict[str, dict[str, Any]]]:
-    """form flat -> {image_id: {ticket_key: {lottery, draw, games:{gk:{id,numbers}}}}}"""
+    """form flat -> {image_id: {ticket_key: {lottery, draw, games:{gk: numbers_str}}}}
+
+    A ordem de inserção em ``games`` reflete a ordem do formulário (= ordem das
+    linhas na tela); o identificador da aposta (A, B, C...) é atribuído depois
+    por posição.
+    """
     data: dict[int, dict[str, dict[str, Any]]] = {}
 
     def ticket_slot(image_id: int, tkey: str) -> dict[str, Any]:
@@ -107,8 +112,7 @@ def _parse_revisar_form(form) -> dict[int, dict[str, dict[str, Any]]]:
         m = _GAME_FIELD_RE.match(key)
         if m:
             slot = ticket_slot(int(m.group(1)), m.group(2))
-            game = slot["games"].setdefault(m.group(3), {"id": "", "numbers": ""})
-            game[m.group(4)] = value
+            slot["games"][m.group(3)] = value
     return data
 
 
@@ -145,6 +149,13 @@ async def upload(
     return RedirectResponse(url=f"/revisar/{batch_id}", status_code=303)
 
 
+_LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+
+def _letter(index: int) -> str:
+    return _LETTERS[index] if index < len(_LETTERS) else str(index + 1)
+
+
 def _ingest_upload(db: Session, payloads: list[tuple[str, bytes]]) -> int:
     batch = Batch()
     db.add(batch)
@@ -171,30 +182,78 @@ def _ingest_upload(db: Session, payloads: list[tuple[str, bytes]]) -> int:
             )
             continue
 
-        for parsed in parsed_tickets:
-            ticket = Ticket(
-                image_id=image.id,
-                status="pending",
-                lottery_type=parsed["lottery_type"],
-                draw_number=parsed["draw_number"],
-                notes=_join_notes(parsed),
-            )
-            ticket.games = [
-                Game(game_identifier=g["identifier"], numbers=g["numbers"])
-                for g in parsed["games"]
-            ]
-            db.add(ticket)
+        _persist_grouped(db, image, parsed_tickets)
 
     db.commit()
     return batch.id
 
 
-def _join_notes(parsed: dict[str, Any]) -> str | None:
-    notes = list(parsed["warnings"])
-    for game in parsed["games"]:
-        for w in game["warnings"]:
-            notes.append(f"Aposta {game['identifier']}: {w}")
-    return "; ".join(notes) or None
+def _persist_grouped(
+    db: Session, image: Image, parsed_tickets: list[dict[str, Any]]
+) -> None:
+    """Consolida a leitura da IA em um comprovante por (modalidade, concurso)."""
+    groups: dict[tuple[str, int], list[list[int]]] = {}
+    orphans: list[dict[str, Any]] = []
+
+    for parsed in parsed_tickets:
+        lottery_type, draw_number = parsed["lottery_type"], parsed["draw_number"]
+        if lottery_type and draw_number is not None:
+            bucket = groups.setdefault((lottery_type, draw_number), [])
+            bucket.extend(g["numbers"] for g in parsed["games"])
+        else:
+            orphans.append(parsed)
+
+    for (lottery_type, draw_number), number_lists in groups.items():
+        seen: set[tuple[int, ...]] = set()
+        unique: list[list[int]] = []
+        duplicates = 0
+        for numbers in number_lists:
+            if not numbers:
+                continue
+            signature = tuple(sorted(numbers))
+            if signature in seen:
+                duplicates += 1
+                continue
+            seen.add(signature)
+            unique.append(sorted(numbers))
+
+        notes: list[str] = []
+        for idx, numbers in enumerate(unique):
+            for warning in validate_numbers(numbers, lottery_type):
+                notes.append(f"aposta {_letter(idx)}: {warning}")
+        if duplicates:
+            notes.append(
+                f"{duplicates} aposta(s) idêntica(s) na leitura foram unificadas "
+                "— confira se nenhum jogo faltou."
+            )
+
+        ticket = Ticket(
+            image_id=image.id,
+            status="pending",
+            lottery_type=lottery_type,
+            draw_number=draw_number,
+            notes="; ".join(notes) or None,
+        )
+        ticket.games = [
+            Game(game_identifier=_letter(idx), numbers=numbers)
+            for idx, numbers in enumerate(unique)
+        ]
+        db.add(ticket)
+
+    for parsed in orphans:
+        ticket = Ticket(
+            image_id=image.id,
+            status="pending",
+            lottery_type=parsed["lottery_type"],
+            draw_number=parsed["draw_number"],
+            notes="; ".join(parsed["warnings"])
+            or "Modalidade/concurso não reconhecidos — preencha manualmente.",
+        )
+        ticket.games = [
+            Game(game_identifier=_letter(idx), numbers=sorted(g["numbers"]))
+            for idx, g in enumerate(parsed["games"])
+        ]
+        db.add(ticket)
 
 
 @app.get("/revisar/{batch_id}", response_class=HTMLResponse)
@@ -254,12 +313,13 @@ def _apply_revisar(
             lottery_type = normalize_lottery_type(tdata["lottery"])
             draw_number = _first_int(tdata["draw"])
 
-            games: list[tuple[str, list[int]]] = []
-            for _, gdata in tdata["games"].items():
-                numbers = sorted(clean_numbers(gdata["numbers"]))
-                identifier = gdata["id"].strip().upper()[:4]
-                if numbers or identifier:
-                    games.append((identifier, numbers))
+            # Ordem do formulário = ordem das linhas na tela; a letra da aposta
+            # é atribuída por posição.
+            games: list[list[int]] = []
+            for raw_numbers in tdata["games"].values():
+                numbers = sorted(clean_numbers(raw_numbers))
+                if numbers:
+                    games.append(numbers)
 
             # comprovante totalmente vazio: ignorar
             if lottery_type is None and not tdata["draw"].strip() and not games:
@@ -274,8 +334,8 @@ def _apply_revisar(
                 ticket_errors.append("informe ao menos uma aposta")
 
             fixed_games: list[tuple[str, list[int]]] = []
-            for idx, (identifier, numbers) in enumerate(games):
-                identifier = identifier or chr(ord("A") + idx)
+            for idx, numbers in enumerate(games):
+                identifier = _letter(idx)
                 for w in validate_numbers(numbers, lottery_type):
                     ticket_errors.append(f"aposta {identifier}: {w}")
                 fixed_games.append((identifier, numbers))
