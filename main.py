@@ -21,6 +21,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session, selectinload
+from starlette.concurrency import run_in_threadpool
 
 from config import settings
 from database import get_db, init_db
@@ -134,14 +135,24 @@ async def upload(
             status_code=400,
         )
 
+    # Lê os uploads no event loop; o trabalho bloqueante (gravação em disco,
+    # chamada à NVIDIA NIM, ORM) roda em threadpool para não travar o servidor.
+    payloads = [
+        (Path(f.filename or "").suffix.lower() or ".jpg", await f.read())
+        for f in images
+    ]
+    batch_id = await run_in_threadpool(_ingest_upload, db, payloads)
+    return RedirectResponse(url=f"/revisar/{batch_id}", status_code=303)
+
+
+def _ingest_upload(db: Session, payloads: list[tuple[str, bytes]]) -> int:
     batch = Batch()
     db.add(batch)
     db.flush()
 
-    for upload_file in images:
-        suffix = Path(upload_file.filename or "").suffix.lower() or ".jpg"
+    for suffix, content in payloads:
         filename = f"{uuid.uuid4().hex}{suffix}"
-        (STORAGE_DIR / filename).write_bytes(await upload_file.read())
+        (STORAGE_DIR / filename).write_bytes(content)
 
         image = Image(batch_id=batch.id, filename=filename)
         db.add(image)
@@ -175,7 +186,7 @@ async def upload(
             db.add(ticket)
 
     db.commit()
-    return RedirectResponse(url=f"/revisar/{batch.id}", status_code=303)
+    return batch.id
 
 
 def _join_notes(parsed: dict[str, Any]) -> str | None:
@@ -204,13 +215,31 @@ def revisar(request: Request, batch_id: int, db: Session = Depends(get_db)):
 async def revisar_submit(
     request: Request, batch_id: int, db: Session = Depends(get_db)
 ):
-    batch = _load_batch(db, batch_id)
-    if batch is None:
+    parsed = _parse_revisar_form(await request.form())
+    outcome, data = await run_in_threadpool(_apply_revisar, db, batch_id, parsed)
+
+    if outcome == "not_found":
         return templates.TemplateResponse(
             request, "index.html", {"error": "Lote não encontrado."}, status_code=404
         )
+    if outcome == "errors":
+        batch = await run_in_threadpool(_load_batch, db, batch_id)
+        return templates.TemplateResponse(
+            request,
+            "revisar.html",
+            {"batch": batch, "lottery_types": LOTTERY_TYPES, "errors": data},
+            status_code=400,
+        )
+    return RedirectResponse(url=f"/historico#batch-{data}", status_code=303)
 
-    parsed = _parse_revisar_form(await request.form())
+
+def _apply_revisar(
+    db: Session, batch_id: int, parsed: dict[int, dict[str, dict[str, Any]]]
+) -> tuple[str, Any]:
+    batch = _load_batch(db, batch_id)
+    if batch is None:
+        return ("not_found", None)
+
     images_by_id = {img.id: img for img in batch.images}
     errors: list[str] = []
 
@@ -277,13 +306,7 @@ async def revisar_submit(
 
     if errors:
         db.commit()
-        batch = _load_batch(db, batch_id)
-        return templates.TemplateResponse(
-            request,
-            "revisar.html",
-            {"batch": batch, "lottery_types": LOTTERY_TYPES, "errors": errors},
-            status_code=400,
-        )
+        return ("errors", errors)
 
     # Busca os resultados oficiais (uma vez por concurso) e finaliza o lote.
     confirmed = [
@@ -299,7 +322,7 @@ async def revisar_submit(
 
     batch.status = "confirmed"
     db.commit()
-    return RedirectResponse(url=f"/historico#batch-{batch.id}", status_code=303)
+    return ("ok", batch.id)
 
 
 def _first_int(text: str) -> int | None:

@@ -17,6 +17,7 @@
   {% endif %}
 
   <form
+    id="upload-form"
     action="/upload"
     method="post"
     enctype="multipart/form-data"
@@ -33,7 +34,8 @@
         class="mt-2 block w-full text-sm text-slate-600
                file:mr-4 file:rounded-md file:border-0 file:bg-slate-900
                file:px-4 file:py-2 file:text-sm file:font-medium file:text-white
-               hover:file:bg-slate-700"
+               hover:file:bg-slate-700
+               disabled:cursor-not-allowed disabled:opacity-50"
       />
       <span class="mt-1 block text-xs text-slate-400">
         Dica: uma foto por comprovante melhora bastante a precisão da leitura.
@@ -41,12 +43,64 @@
     </label>
 
     <button
+      id="upload-submit"
       type="submit"
-      class="w-full rounded-md bg-emerald-600 px-4 py-2.5 text-sm font-semibold
-             text-white shadow-sm hover:bg-emerald-500"
+      class="flex w-full items-center justify-center gap-2 rounded-md bg-emerald-600
+             px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-500
+             disabled:cursor-not-allowed disabled:bg-emerald-600/70"
     >
-      Enviar para leitura
+      <svg id="upload-spinner" class="hidden h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+        <path class="opacity-90" fill="currentColor" d="M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4z"></path>
+      </svg>
+      <span id="upload-submit-label">Enviar para leitura</span>
     </button>
   </form>
 </div>
+
+<div
+  id="upload-overlay"
+  class="fixed inset-0 z-50 hidden flex-col items-center justify-center gap-4
+         bg-slate-900/60 backdrop-blur-sm"
+>
+  <svg class="h-10 w-10 animate-spin text-white" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+    <path class="opacity-90" fill="currentColor" d="M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4z"></path>
+  </svg>
+  <p class="text-sm font-medium text-white">Lendo os comprovantes com IA… isso pode levar alguns segundos.</p>
+</div>
+
+<script>
+(function () {
+  var form = document.getElementById("upload-form");
+  if (!form) return;
+  var spinner = document.getElementById("upload-spinner");
+  var label = document.getElementById("upload-submit-label");
+  var overlay = document.getElementById("upload-overlay");
+
+  function lock() {
+    spinner.classList.remove("hidden");
+    label.textContent = "Enviando…";
+    overlay.classList.remove("hidden");
+    overlay.classList.add("flex");
+    // Adiado: desabilitar os campos ANTES do submit nativo remove os arquivos
+    // do corpo da requisição. O overlay (z-50) já impede qualquer clique.
+    setTimeout(function () {
+      form.querySelectorAll("input, button").forEach(function (el) { el.disabled = true; });
+    }, 0);
+  }
+
+  function unlock() {
+    form.querySelectorAll("input, button").forEach(function (el) { el.disabled = false; });
+    spinner.classList.add("hidden");
+    label.textContent = "Enviar para leitura";
+    overlay.classList.add("hidden");
+    overlay.classList.remove("flex");
+  }
+
+  form.addEventListener("submit", lock);
+  // Volta pelo histórico (bfcache): restaura o formulário utilizável.
+  window.addEventListener("pageshow", function (ev) { if (ev.persisted) unlock(); });
+})();
+</script>
 {% endblock %}
