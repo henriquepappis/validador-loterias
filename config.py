@@ -27,7 +27,7 @@ class Settings(BaseSettings):
     # Área mínima de um bilhete, como fração da imagem (descarta ruído/bordas)
     segmentation_min_area_frac: float = 0.03
     # Lado mínimo (px) a que um recorte é ampliado para ajudar o OCR
-    segmentation_upscale_to: int = 1400
+    segmentation_upscale_to: int = 1700
 
     # Scraper da Caixa
     caixa_headless: bool = True

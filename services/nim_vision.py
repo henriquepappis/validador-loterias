@@ -40,8 +40,13 @@ JSON, no formato:
 
 Regras:
 - Um item em "tickets" para CADA comprovante visível (quase sempre apenas um).
-- Em "games", liste TODAS as apostas daquele comprovante, na ordem impressa e
-  sem repetir nenhuma.
+- "draw_number" é o número que aparece depois de "CONC" ou "Concurso", perto do
+  valor "TOTAL R$". NÃO use a data (ex.: 09SET2026) nem o ano como concurso.
+- Cada aposta é uma linha que começa com uma letra (A, B, C, ...) seguida das
+  dezenas, cada uma com dois dígitos. Transcreva TODAS as dezenas da linha,
+  inclusive a primeira. Mega-Sena tem 6+ dezenas por linha; Quina tem 5+.
+- Em "games", liste TODAS as apostas do comprovante, na ordem impressa, sem
+  repetir nenhuma.
 - "numbers" são inteiros, sem zero à esquerda (4, não "04") e sem sufixos.
 - Mega-Sena: dezenas de 1 a 60. Quina: dezenas de 1 a 80.
 - Não invente dados. Se uma dezena estiver ilegível, omita-a.
@@ -96,8 +101,24 @@ def _to_int(value: Any) -> int | None:
     return int(match.group()) if match else None
 
 
-def _normalize_ticket(raw: dict[str, Any], index: int) -> dict[str, Any]:
+def _game_numbers(raw_game: Any) -> list[int]:
+    """Aceita {'numbers': [...]}, {'dezenas': [...]}, [...] ou '01 02 03'."""
+    if isinstance(raw_game, dict):
+        for key in ("numbers", "dezenas", "numeros", "values"):
+            if key in raw_game:
+                return clean_numbers(raw_game[key])
+        return []
+    return clean_numbers(raw_game)
+
+
+def _normalize_ticket(raw: Any, index: int) -> dict[str, Any]:
     warnings: list[str] = []
+
+    # A IA às vezes devolve o ticket como lista (de apostas) em vez de objeto.
+    if isinstance(raw, list):
+        raw = {"games": raw}
+    elif not isinstance(raw, dict):
+        raw = {}
 
     lottery_type = normalize_lottery_type(raw.get("lottery_type"))
     if lottery_type is None:
@@ -107,13 +128,16 @@ def _normalize_ticket(raw: dict[str, Any], index: int) -> dict[str, Any]:
     if draw_number is None:
         warnings.append("Concurso não reconhecido na leitura — informe manualmente.")
 
+    raw_games = raw.get("games") or raw.get("apostas") or []
+    if not isinstance(raw_games, list):
+        raw_games = []
+
     games: list[dict[str, Any]] = []
-    for gi, raw_game in enumerate(raw.get("games") or []):
-        identifier = (
-            str(raw_game.get("identifier") or "").strip().upper()[:4]
-            or chr(ord("A") + gi)
-        )
-        numbers = clean_numbers(raw_game.get("numbers"))
+    for gi, raw_game in enumerate(raw_games):
+        identifier = chr(ord("A") + gi)
+        if isinstance(raw_game, dict) and raw_game.get("identifier"):
+            identifier = str(raw_game["identifier"]).strip().upper()[:4] or identifier
+        numbers = _game_numbers(raw_game)
         games.append(
             {
                 "identifier": identifier,
@@ -173,10 +197,16 @@ def extract_tickets(image_path: str | Path) -> list[dict[str, Any]]:
             f"Resposta da IA não é JSON válido: {content[:500]!r}"
         ) from exc
 
-    raw_tickets = payload.get("tickets")
-    if raw_tickets is None and "games" in payload:
-        raw_tickets = [payload]  # tolera o formato de comprovante único
+    if isinstance(payload, list):
+        raw_tickets = payload
+    elif isinstance(payload, dict):
+        raw_tickets = payload.get("tickets")
+        if raw_tickets is None and ("games" in payload or "apostas" in payload):
+            raw_tickets = [payload]  # formato de comprovante único
+    else:
+        raw_tickets = None
+
     if not isinstance(raw_tickets, list) or not raw_tickets:
         raise ValueError(f"Nenhum comprovante identificado na leitura: {content[:500]!r}")
 
-    return [_normalize_ticket(t or {}, i) for i, t in enumerate(raw_tickets)]
+    return [_normalize_ticket(t, i) for i, t in enumerate(raw_tickets)]
