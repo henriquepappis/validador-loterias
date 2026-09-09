@@ -28,8 +28,11 @@ Diferenças em relação ao rascunho inicial (implementadas):
 * **Template Engine & UI:** Jinja2 + Tailwind CSS (via CDN)
 * **Banco de Dados:** PostgreSQL (docker-compose para desenvolvimento)
 * **ORM:** SQLAlchemy 2.0 (mapeamento declarativo tipado) + padrão de serviços
+* **Segmentação de Imagem:** OpenCV (`opencv-python-headless`) — recorta cada
+  bilhete da foto (Otsu + morfologia + `minAreaRect` + correção de perspectiva)
+  antes do OCR; sem separação confiável, usa a foto inteira.
 * **Processamento de Imagem / IA:** NVIDIA NIM Vision API
-  (`meta/llama-3.2-11b-vision-instruct`) via SDK compatível com OpenAI.
+  (`meta/llama-3.2-90b-vision-instruct`) via SDK compatível com OpenAI.
 * **Coleta de Resultados:** API pública do Portal de Loterias da Caixa
   (`servicebus2.caixa.gov.br`) como fonte primária, com **fallback em
   Playwright** (import preguiçoso; browsers opcionais).
@@ -51,8 +54,9 @@ validador-loterias/
 │   ├── game.py              # Apostas individuais (A, B, C...) e dezenas
 │   └── draw.py              # Resultados oficiais dos concursos da Caixa
 ├── services/
+│   ├── segmentation.py      # Recorte automático de cada bilhete na foto (OpenCV)
 │   ├── lottery.py           # Regras das modalidades: normalização e validação
-│   ├── nim_vision.py        # OCR via NVIDIA NIM (extrai N comprovantes por imagem)
+│   ├── nim_vision.py        # OCR via NVIDIA NIM (um comprovante por recorte)
 │   ├── caixa_scraper.py     # Resultado oficial (API da Caixa + fallback Playwright, com cache)
 │   └── validator.py         # Cruzamento aposta × sorteio e faixas de premiação
 ├── templates/
@@ -139,12 +143,21 @@ Restrição: `UNIQUE (lottery_type, draw_number)`.
   separadas por qualquer caractere; remove duplicatas preservando ordem.
 * `validate_numbers(numeros, modalidade)` → lista de avisos (vazia = consistente).
 
-### 5.2. Módulo de Leitura (`services/nim_vision.py`)
+### 5.2. Segmentação (`services/segmentation.py`)
 
-* `extract_tickets(image_path)` recebe o caminho da imagem, converte para
-  Base64 e envia ao endpoint da NVIDIA NIM
-  (`https://integrate.api.nvidia.com/v1`) com o modelo multimodal.
-* **Prompt estruturado:** a imagem pode conter vários comprovantes; a IA deve
+* `split_tickets(image_bytes)` → lista de bytes JPEG, um por bilhete detectado
+  (Otsu + `MORPH_CLOSE` + contornos externos filtrados por área/proporção +
+  `minAreaRect` + `warpPerspective` para corrigir inclinação; recortes pequenos
+  são ampliados). Sem separar ao menos 2 regiões, devolve `[imagem_original]`.
+* Controlado por `SEGMENTATION_ENABLED`, `SEGMENTATION_MIN_AREA_FRAC`,
+  `SEGMENTATION_UPSCALE_TO`. Cada recorte vira uma linha em `images`.
+
+### 5.3. Módulo de Leitura (`services/nim_vision.py`)
+
+* `extract_tickets(image_path)` converte a imagem (normalmente já um recorte de
+  um único bilhete) para Base64 e envia à NVIDIA NIM
+  (`https://integrate.api.nvidia.com/v1`).
+* **Prompt estruturado:** a imagem mostra geralmente UM comprovante; a IA deve
   retornar JSON estrito:
 
   ```json
@@ -153,7 +166,7 @@ Restrição: `UNIQUE (lottery_type, draw_number)`.
       {
         "lottery_type": "Mega-Sena" | "Quina",
         "draw_number": 3056,
-        "games": [{ "identifier": "A", "numbers": [4, 10, 24, 36, 40, 54] }]
+        "games": [{ "numbers": [4, 10, 24, 36, 40, 54] }]
       }
     ]
   }
@@ -163,8 +176,10 @@ Restrição: `UNIQUE (lottery_type, draw_number)`.
   alfabéticos (`5a` → `5`) e vírgula sobrando antes de fechar. Cada comprovante
   e cada aposta recebem `warnings` de `validate_numbers`.
 * Retorno: lista de dicts `{lottery_type|None, draw_number|None, games[], warnings[]}`.
+* Em `_persist_tickets`, cada item vira um `Ticket`; apostas idênticas repetidas
+  pela IA são unificadas (com aviso) e re-letradas A, B, C… por bilhete.
 
-### 5.3. Módulo de Resultados (`services/caixa_scraper.py`)
+### 5.4. Módulo de Resultados (`services/caixa_scraper.py`)
 
 * `fetch_draw(lottery_type, draw_number, db)`:
   1. Consulta o cache na tabela `draws`; se existir, retorna.
@@ -177,7 +192,7 @@ Restrição: `UNIQUE (lottery_type, draw_number)`.
 * `DrawNotFoundError` quando nenhuma fonte responde; o chamador trata como aviso
   (não bloqueia o cadastro).
 
-### 5.4. Módulo de Validação (`services/validator.py`)
+### 5.5. Módulo de Validação (`services/validator.py`)
 
 * `evaluate(numbers, drawn_numbers, lottery_type)` → `{hits, hit_count, prize,
   is_winner}`.
@@ -185,25 +200,31 @@ Restrição: `UNIQUE (lottery_type, draw_number)`.
   * **Mega-Sena:** 6 = Sena, 5 = Quina, 4 = Quadra; senão "Sem Premiação".
   * **Quina:** 5 = Quina, 4 = Quadra, 3 = Terno, 2 = Duque; senão "Sem Premiação".
 
-### 5.5. Interface Web (FastAPI + Jinja2)
+### 5.6. Interface Web (FastAPI + Jinja2)
 
-* **`GET /`** — formulário de upload com `input[type=file] multiple` (PNG/JPEG).
-* **`POST /upload`** — para cada imagem: salva em `storage/tickets/` com nome
-  único, roda `nim_vision.extract_tickets`, cria `Image` + `Ticket`s/`Game`s com
-  `status = pending`. Falha de OCR numa imagem não aborta o lote (gera
-  comprovante em branco com `notes`). Redireciona para `/revisar/{batch_id}`.
-* **`GET /revisar/{batch_id}`** — formulário editável por comprovante
-  (modalidade, concurso, apostas), com os avisos da leitura. Botões para
-  adicionar comprovantes e apostas (clonagem via `<template>` + JS mínimo).
-* **`POST /revisar/{batch_id}`** — parseia o formulário, valida
-  (`validate_numbers`), grava. Comprovantes válidos viram `confirmed`;
-  inválidos permanecem `pending` e a página é re-renderizada com os erros (HTTP
-  400) sem finalizar. Sem erros: busca o resultado de cada concurso distinto
-  (`caixa_scraper.fetch_draw`), marca o `batch` como `confirmed` e redireciona
-  para `/historico#batch-{id}`.
-* **`GET /historico`** — lotes confirmados agrupados por imagem, com miniatura/
-  link da foto, dezenas jogadas (acertos destacados), sorteio oficial e faixa
-  de premiação. Seção no topo lista **revisões pendentes** (link para `/revisar`).
+O trabalho bloqueante (OpenCV, NVIDIA NIM, scraper, ORM) roda via
+`run_in_threadpool`; os handlers `async` apenas leem a requisição.
+
+* **`GET /`** — upload com `input[type=file] multiple` (PNG/JPEG); ao enviar,
+  overlay de "processando" que bloqueia o formulário.
+* **`POST /upload`** — para cada arquivo: `segmentation.split_tickets` recorta os
+  bilhetes (cada recorte → uma `Image`), roda `nim_vision.extract_tickets` por
+  recorte e grava `Ticket`s/`Game`s com `status = pending`. Falha de OCR num
+  recorte não aborta o lote. Redireciona para `/revisar/{batch_id}`.
+* **`GET /revisar/{batch_id}`** — formulário agrupado por **modalidade**
+  (Mega-Sena, Quina, Não identificado); dentro de cada grupo, um cartão por
+  bilhete com suas apostas A, B, C… (contagem reinicia por bilhete) e link para
+  o recorte. O identificador da aposta é automático (posição). Botões "+ aposta"
+  e "+ bilhete nesta modalidade" clonam via `<template>` + JS mínimo.
+* **`POST /revisar/{batch_id}`** — parseia o formulário (nomes
+  `image_<id>_ticket_<key>_...`; ordem das linhas = ordem das letras), valida
+  (`validate_numbers`). Bilhetes válidos viram `confirmed`; inválidos ficam
+  `pending` e a página volta com os erros (HTTP 400) sem finalizar. Sem erros:
+  busca o resultado de cada concurso distinto, marca o `batch` como `confirmed`
+  e redireciona para `/historico#batch-{id}`.
+* **`GET /historico`** — lotes confirmados, agrupados por modalidade e por
+  bilhete, com link do recorte, dezenas jogadas (acertos destacados), sorteio
+  oficial e faixa de premiação. Seção no topo lista **revisões pendentes**.
 
 ---
 
@@ -220,6 +241,8 @@ openai>=1.12.0
 playwright>=1.42.0
 pydantic-settings>=2.2.0
 httpx>=0.27.0
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
 ```
 
 Setup resumido:

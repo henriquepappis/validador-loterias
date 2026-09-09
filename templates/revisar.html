@@ -15,9 +15,17 @@
 {% endmacro %}
 
 {# --------------------------------------------------------------------- #}
-{% macro ticket_card(image_id, tkey, ticket, lottery_types) %}
+{% macro ticket_card(image_id, tkey, ticket, lottery_types, preset='', title='Bilhete') %}
 {% set ngames = ticket.games | length if ticket else 0 %}
 <fieldset class="ticket-card mt-3 rounded-lg border border-slate-200 p-4">
+  <div class="mb-2 flex items-center justify-between">
+    <span class="text-xs font-semibold uppercase tracking-wide text-slate-500">{{ title }}</span>
+    {% if ticket %}
+    <a href="/storage/{{ ticket.image.filename }}" target="_blank"
+       class="text-xs font-medium text-emerald-600 underline">ver recorte</a>
+    {% endif %}
+  </div>
+
   <div class="grid gap-3 sm:grid-cols-2">
     <label class="text-sm">
       <span class="mb-1 block text-slate-600">Modalidade</span>
@@ -26,8 +34,8 @@
         class="w-full rounded border border-slate-300 px-2 py-1.5 text-sm">
         <option value="">—</option>
         {% for lt in lottery_types %}
-        <option value="{{ lt }}"
-          {% if ticket and ticket.lottery_type == lt %}selected{% endif %}>{{ lt }}</option>
+        {% set chosen = ticket.lottery_type if ticket else preset %}
+        <option value="{{ lt }}" {% if chosen == lt %}selected{% endif %}>{{ lt }}</option>
         {% endfor %}
       </select>
     </label>
@@ -66,9 +74,9 @@
 <div class="mx-auto max-w-3xl">
   <h1 class="text-2xl font-bold text-slate-900">Revisar leitura</h1>
   <p class="mt-1 text-sm text-slate-500">
-    Cada bloco é uma modalidade + concurso, com todas as apostas lidas. Corrija
-    as dezenas, adicione apostas que faltaram e confirme para apurar. A letra
-    (A, B, C…) segue a ordem das linhas.
+    Um bloco por modalidade; dentro dele, um cartão por bilhete com suas apostas
+    A, B, C… (a contagem recomeça em cada bilhete). Corrija as dezenas, adicione
+    o que faltou e confirme para apurar.
   </p>
 
   {% if errors %}
@@ -81,23 +89,24 @@
   {% endif %}
 
   <form method="post" action="/revisar/{{ batch.id }}" class="mt-6 space-y-6">
-    {% for image in batch.images %}
+    {% for group in groups %}
+    {% set gslug = loop.index0 %}
     <section class="rounded-xl bg-white p-5 shadow-sm">
-      <div class="flex items-center justify-between">
-        <h2 class="text-sm font-semibold text-slate-700">Imagem #{{ image.id }}</h2>
-        <a href="/storage/{{ image.filename }}" target="_blank"
-           class="text-xs font-medium text-emerald-600 underline">ver foto</a>
-      </div>
+      <h2 class="text-sm font-bold text-slate-800">{{ group.label }}</h2>
 
-      <div class="tickets" id="tickets-{{ image.id }}">
-        {% for ticket in image.tickets %}
-        {{ ticket_card(image.id, ticket.id | string, ticket, lottery_types) }}
+      <div class="tickets" id="group-{{ gslug }}" data-preset="{{ group.lottery_type or '' }}"
+           data-anchor="{{ anchor_image_id }}">
+        {% for ticket in group.tickets %}
+        {{ ticket_card(ticket.image_id, ticket.id | string, ticket, lottery_types,
+                       group.lottery_type, 'Bilhete ' ~ loop.index) }}
         {% endfor %}
-        {{ ticket_card(image.id, 'n0', None, lottery_types) }}
+        {{ ticket_card(anchor_image_id, 'sn' ~ gslug, None, lottery_types,
+                       group.lottery_type, 'Novo bilhete') }}
       </div>
 
       <button type="button" class="add-ticket mt-3 text-sm font-medium text-emerald-600"
-        data-image-id="{{ image.id }}">+ modalidade / concurso</button>
+        data-group="{{ gslug }}" data-anchor="{{ anchor_image_id }}"
+        data-preset="{{ group.lottery_type or '' }}">+ bilhete nesta modalidade</button>
     </section>
     {% endfor %}
 
@@ -108,7 +117,7 @@
   </form>
 </div>
 
-<template id="ticket-tpl">{{ ticket_card('__IMG__', '__TK__', None, lottery_types) }}</template>
+<template id="ticket-tpl">{{ ticket_card('__IMG__', '__TK__', None, lottery_types, '__PRESET__', 'Novo bilhete') }}</template>
 <template id="game-tpl">{{ game_row('__IMG__', '__TK__', '__GK__', '__LABEL__') }}</template>
 
 <script>
@@ -122,14 +131,15 @@
   document.addEventListener("click", function (ev) {
     var addTicket = ev.target.closest(".add-ticket");
     if (addTicket) {
-      var img = addTicket.dataset.imageId;
+      var preset = addTicket.dataset.preset || "";
       var html = document.getElementById("ticket-tpl").innerHTML
-        .split("__IMG__").join(img)
+        .split("__IMG__").join(addTicket.dataset.anchor)
         .split("__TK__").join("n" + (++seq))
+        .split("__PRESET__").join(preset)
         .split("__LABEL__").join("");
       var box = document.createElement("div");
       box.innerHTML = html.trim();
-      document.getElementById("tickets-" + img).appendChild(box.firstElementChild);
+      document.getElementById("group-" + addTicket.dataset.group).appendChild(box.firstElementChild);
       return;
     }
     var addGame = ev.target.closest(".add-game");

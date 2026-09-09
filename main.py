@@ -30,7 +30,7 @@ from models.draw import Draw
 from models.game import Game
 from models.image import Image
 from models.ticket import Ticket
-from services import caixa_scraper, nim_vision, validator
+from services import caixa_scraper, nim_vision, segmentation, validator
 from services.lottery import (
     LOTTERY_TYPES,
     clean_numbers,
@@ -150,10 +150,35 @@ async def upload(
 
 
 _LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+_MODALITY_ORDER = {"Mega-Sena": 0, "Quina": 1}
 
 
 def _letter(index: int) -> str:
     return _LETTERS[index] if index < len(_LETTERS) else str(index + 1)
+
+
+def _group_tickets_by_modality(batch: Batch) -> list[dict[str, Any]]:
+    """Agrupa todos os bilhetes do lote por modalidade (Mega-Sena, Quina, ...)."""
+    buckets: dict[str | None, list[Ticket]] = {}
+    for image in batch.images:
+        for ticket in image.tickets:
+            buckets.setdefault(ticket.lottery_type, []).append(ticket)
+
+    # Sempre mostra as duas modalidades conhecidas, mesmo vazias.
+    for known in LOTTERY_TYPES:
+        buckets.setdefault(known, [])
+
+    ordered = sorted(
+        buckets, key=lambda k: (_MODALITY_ORDER.get(k, 9), k or "zzz")
+    )
+    return [
+        {
+            "lottery_type": lt,
+            "label": lt or "Não identificado",
+            "tickets": buckets[lt],
+        }
+        for lt in ordered
+    ]
 
 
 def _ingest_upload(db: Session, payloads: list[tuple[str, bytes]]) -> int:
@@ -162,62 +187,70 @@ def _ingest_upload(db: Session, payloads: list[tuple[str, bytes]]) -> int:
     db.flush()
 
     for suffix, content in payloads:
-        filename = f"{uuid.uuid4().hex}{suffix}"
-        (STORAGE_DIR / filename).write_bytes(content)
+        # Recorta cada bilhete da foto; cada recorte vira uma Image própria.
+        crops = segmentation.split_tickets(content)
+        for crop in crops:
+            crop_suffix = ".jpg" if len(crops) > 1 else (suffix or ".jpg")
+            filename = f"{uuid.uuid4().hex}{crop_suffix}"
+            (STORAGE_DIR / filename).write_bytes(crop)
 
-        image = Image(batch_id=batch.id, filename=filename)
-        db.add(image)
-        db.flush()
+            image = Image(batch_id=batch.id, filename=filename)
+            db.add(image)
+            db.flush()
 
-        try:
-            parsed_tickets = nim_vision.extract_tickets(STORAGE_DIR / filename)
-        except Exception as exc:  # noqa: BLE001 - falha de OCR não aborta o lote
-            logger.exception("OCR falhou para %s", filename)
-            db.add(
-                Ticket(
-                    image_id=image.id,
-                    status="pending",
-                    notes=f"Leitura automática falhou ({exc}). Preencha manualmente.",
+            try:
+                parsed_tickets = nim_vision.extract_tickets(STORAGE_DIR / filename)
+            except Exception as exc:  # noqa: BLE001 - falha de OCR não aborta o lote
+                logger.exception("OCR falhou para %s", filename)
+                db.add(
+                    Ticket(
+                        image_id=image.id,
+                        status="pending",
+                        notes=(
+                            f"Leitura automática falhou ({exc}). "
+                            "Preencha manualmente."
+                        ),
+                    )
                 )
-            )
-            continue
+                continue
 
-        _persist_grouped(db, image, parsed_tickets)
+            _persist_tickets(db, image, parsed_tickets)
 
     db.commit()
     return batch.id
 
 
-def _persist_grouped(
+def _persist_tickets(
     db: Session, image: Image, parsed_tickets: list[dict[str, Any]]
 ) -> None:
-    """Consolida a leitura da IA em um comprovante por (modalidade, concurso)."""
-    groups: dict[tuple[str, int], list[list[int]]] = {}
-    orphans: list[dict[str, Any]] = []
+    """Grava um comprovante por item lido; apostas re-letradas A, B, C..."""
+    seen_tickets: set[tuple] = set()
 
     for parsed in parsed_tickets:
-        lottery_type, draw_number = parsed["lottery_type"], parsed["draw_number"]
-        if lottery_type and draw_number is not None:
-            bucket = groups.setdefault((lottery_type, draw_number), [])
-            bucket.extend(g["numbers"] for g in parsed["games"])
-        else:
-            orphans.append(parsed)
+        lottery_type = parsed["lottery_type"]
+        draw_number = parsed["draw_number"]
 
-    for (lottery_type, draw_number), number_lists in groups.items():
-        seen: set[tuple[int, ...]] = set()
+        seen_numbers: set[tuple[int, ...]] = set()
         unique: list[list[int]] = []
         duplicates = 0
-        for numbers in number_lists:
+        for game in parsed["games"]:
+            numbers = sorted(game["numbers"])
             if not numbers:
                 continue
-            signature = tuple(sorted(numbers))
-            if signature in seen:
+            signature = tuple(numbers)
+            if signature in seen_numbers:
                 duplicates += 1
                 continue
-            seen.add(signature)
-            unique.append(sorted(numbers))
+            seen_numbers.add(signature)
+            unique.append(numbers)
 
-        notes: list[str] = []
+        # Comprovante idêntico repetido pela IA: ignora.
+        ticket_signature = (lottery_type, draw_number, frozenset(seen_numbers))
+        if unique and ticket_signature in seen_tickets:
+            continue
+        seen_tickets.add(ticket_signature)
+
+        notes: list[str] = list(parsed["warnings"])
         for idx, numbers in enumerate(unique):
             for warning in validate_numbers(numbers, lottery_type):
                 notes.append(f"aposta {_letter(idx)}: {warning}")
@@ -226,6 +259,8 @@ def _persist_grouped(
                 f"{duplicates} aposta(s) idêntica(s) na leitura foram unificadas "
                 "— confira se nenhum jogo faltou."
             )
+        if not (lottery_type and draw_number is not None) and not notes:
+            notes.append("Modalidade/concurso não reconhecidos — preencha.")
 
         ticket = Ticket(
             image_id=image.id,
@@ -240,20 +275,15 @@ def _persist_grouped(
         ]
         db.add(ticket)
 
-    for parsed in orphans:
-        ticket = Ticket(
-            image_id=image.id,
-            status="pending",
-            lottery_type=parsed["lottery_type"],
-            draw_number=parsed["draw_number"],
-            notes="; ".join(parsed["warnings"])
-            or "Modalidade/concurso não reconhecidos — preencha manualmente.",
-        )
-        ticket.games = [
-            Game(game_identifier=_letter(idx), numbers=sorted(g["numbers"]))
-            for idx, g in enumerate(parsed["games"])
-        ]
-        db.add(ticket)
+
+def _revisar_context(batch: Batch, errors: list[str]) -> dict[str, Any]:
+    return {
+        "batch": batch,
+        "groups": _group_tickets_by_modality(batch),
+        "anchor_image_id": batch.images[0].id if batch.images else 0,
+        "lottery_types": LOTTERY_TYPES,
+        "errors": errors,
+    }
 
 
 @app.get("/revisar/{batch_id}", response_class=HTMLResponse)
@@ -264,9 +294,7 @@ def revisar(request: Request, batch_id: int, db: Session = Depends(get_db)):
             request, "index.html", {"error": "Lote não encontrado."}, status_code=404
         )
     return templates.TemplateResponse(
-        request,
-        "revisar.html",
-        {"batch": batch, "lottery_types": LOTTERY_TYPES, "errors": []},
+        request, "revisar.html", _revisar_context(batch, [])
     )
 
 
@@ -286,7 +314,7 @@ async def revisar_submit(
         return templates.TemplateResponse(
             request,
             "revisar.html",
-            {"batch": batch, "lottery_types": LOTTERY_TYPES, "errors": data},
+            _revisar_context(batch, data),
             status_code=400,
         )
     return RedirectResponse(url=f"/historico#batch-{data}", status_code=303)
@@ -408,34 +436,42 @@ def historico(request: Request, db: Session = Depends(get_db)):
     pending_batches: list[Batch] = []
 
     for batch in batches:
-        images_view = []
+        buckets: dict[str | None, list[dict[str, Any]]] = {}
         for image in batch.images:
-            tickets_view = []
             for ticket in image.tickets:
                 if ticket.status != "confirmed":
                     continue
                 draw = draws.get((ticket.lottery_type, ticket.draw_number))
-                games_view = [
+                buckets.setdefault(ticket.lottery_type, []).append(
                     {
-                        "game": game,
-                        "result": (
-                            validator.evaluate(
-                                game.numbers, draw.drawn_numbers, ticket.lottery_type
-                            )
-                            if draw
-                            else None
-                        ),
+                        "ticket": ticket,
+                        "draw": draw,
+                        "games": [
+                            {
+                                "game": game,
+                                "result": (
+                                    validator.evaluate(
+                                        game.numbers,
+                                        draw.drawn_numbers,
+                                        ticket.lottery_type,
+                                    )
+                                    if draw
+                                    else None
+                                ),
+                            }
+                            for game in ticket.games
+                        ],
                     }
-                    for game in ticket.games
-                ]
-                tickets_view.append(
-                    {"ticket": ticket, "draw": draw, "games": games_view}
                 )
-            if tickets_view:
-                images_view.append({"image": image, "tickets": tickets_view})
 
-        if images_view:
-            confirmed_batches.append({"batch": batch, "images": images_view})
+        if buckets:
+            groups = [
+                {"label": lt or "Não identificado", "tickets": buckets[lt]}
+                for lt in sorted(
+                    buckets, key=lambda k: (_MODALITY_ORDER.get(k, 9), k or "zzz")
+                )
+            ]
+            confirmed_batches.append({"batch": batch, "groups": groups})
         if batch.status != "confirmed":
             pending_batches.append(batch)
 

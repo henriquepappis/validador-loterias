@@ -17,10 +17,17 @@ class Settings(BaseSettings):
     # NVIDIA NIM Vision (SDK compatível com OpenAI)
     nim_api_key: str = ""
     nim_base_url: str = "https://integrate.api.nvidia.com/v1"
-    nim_model: str = "meta/llama-3.2-11b-vision-instruct"
+    nim_model: str = "meta/llama-3.2-90b-vision-instruct"
 
     # Armazenamento local de bilhetes
     storage_dir: str = "storage/tickets"
+
+    # Segmentação: recorta cada bilhete da foto antes do OCR
+    segmentation_enabled: bool = True
+    # Área mínima de um bilhete, como fração da imagem (descarta ruído/bordas)
+    segmentation_min_area_frac: float = 0.03
+    # Lado mínimo (px) a que um recorte é ampliado para ajudar o OCR
+    segmentation_upscale_to: int = 1400
 
     # Scraper da Caixa
     caixa_headless: bool = True

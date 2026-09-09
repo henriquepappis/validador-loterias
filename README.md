@@ -38,11 +38,13 @@ Acesse http://localhost:8000
 
 | Caminho | Responsabilidade |
 | --- | --- |
-| `main.py` | App FastAPI, rotas `GET /`, `POST /upload`, `GET /historico` |
+| `main.py` | App FastAPI, rotas `GET /`, `POST /upload`, `GET/POST /revisar`, `GET /historico` |
 | `config.py` | Variáveis de ambiente (`pydantic-settings`) |
 | `database.py` | Engine/sessão SQLAlchemy e `init_db()` |
-| `models/` | Tabelas `tickets`, `games`, `draws` |
-| `services/nim_vision.py` | OCR do bilhete via NVIDIA NIM |
+| `models/` | Tabelas `batches`, `images`, `tickets`, `games`, `draws` |
+| `services/segmentation.py` | Recorte automático de cada bilhete na foto (OpenCV) |
+| `services/nim_vision.py` | OCR do bilhete via NVIDIA NIM (`llama-3.2-90b-vision-instruct`) |
+| `services/lottery.py` | Regras das modalidades: normalização e validação de dezenas |
 | `services/caixa_scraper.py` | Resultado oficial (API da Caixa + fallback Playwright), com cache |
 | `services/validator.py` | Cruzamento aposta × sorteio e faixas de premiação |
 | `templates/` | `base.html`, `index.html`, `historico.html` |
