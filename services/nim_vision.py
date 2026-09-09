@@ -1,4 +1,8 @@
-"""Integração com a API da NVIDIA NIM para OCR inteligente de bilhetes."""
+"""Integração com a API da NVIDIA NIM para OCR inteligente de comprovantes.
+
+A imagem enviada pode conter VÁRIOS comprovantes; `extract_tickets` devolve
+uma lista, um item por comprovante, já com avisos de validação.
+"""
 from __future__ import annotations
 
 import base64
@@ -11,37 +15,39 @@ from typing import Any
 from openai import OpenAI
 
 from config import settings
-
-LOTTERY_TYPES = {"Mega-Sena", "Quina"}
+from services.lottery import clean_numbers, normalize_lottery_type, validate_numbers
 
 _EXTRACTION_PROMPT = """
-Você é um extrator de dados de bilhetes de loteria da Caixa Econômica Federal.
-Analise a imagem do bilhete e devolva ESTRITAMENTE um objeto JSON válido,
-sem texto antes ou depois, sem markdown, no formato:
+Você é um extrator de dados de comprovantes de loteria da Caixa Econômica
+Federal (apenas Mega-Sena e Quina). A imagem pode conter VÁRIOS comprovantes.
+
+Devolva ESTRITAMENTE um JSON válido, sem markdown e sem qualquer texto fora do
+JSON, no formato:
 
 {
-  "lottery_type": "Mega-Sena" | "Quina",
-  "draw_number": <inteiro do concurso>,
-  "games": [
-    { "identifier": "A", "numbers": [<inteiros das dezenas jogadas>] },
-    { "identifier": "B", "numbers": [...] }
+  "tickets": [
+    {
+      "lottery_type": "Mega-Sena" | "Quina",
+      "draw_number": <inteiro do concurso>,
+      "games": [
+        { "identifier": "A", "numbers": [<inteiros das dezenas apostadas>] }
+      ]
+    }
   ]
 }
 
 Regras:
-- "lottery_type" deve ser exatamente "Mega-Sena" ou "Quina".
-- "draw_number" é o número do concurso impresso no bilhete (apenas dígitos).
-- Cada aposta do bilhete vira um item em "games", com o identificador impresso
-  (A, B, C, ...) e a lista de dezenas como inteiros (ex: 4, não "04").
-- Não invente dados. Se algo estiver ilegível, omita o item correspondente.
+- Um item em "tickets" para CADA comprovante distinto visível na imagem.
+- "numbers" são inteiros, sem zero à esquerda (4, não "04") e sem sufixos.
+- Mega-Sena: dezenas de 1 a 60. Quina: dezenas de 1 a 80.
+- Não invente dados. Se uma dezena estiver ilegível, omita-a.
+- Responda apenas com o JSON.
 """.strip()
 
 
 def _client() -> OpenAI:
     if not settings.nim_api_key:
-        raise RuntimeError(
-            "NIM_API_KEY não configurada. Defina no arquivo .env."
-        )
+        raise RuntimeError("NIM_API_KEY não configurada. Defina no arquivo .env.")
     return OpenAI(base_url=settings.nim_base_url, api_key=settings.nim_api_key)
 
 
@@ -55,70 +61,85 @@ def _strip_json(content: str) -> str:
     content = content.strip()
     fence = re.match(r"^```(?:json)?\s*(.*?)\s*```$", content, re.DOTALL)
     if fence:
-        return fence.group(1).strip()
-    # fallback: recorta do primeiro { até o último }
+        content = fence.group(1).strip()
     start, end = content.find("{"), content.rfind("}")
     if start != -1 and end != -1 and end > start:
         return content[start : end + 1]
     return content
 
 
-def _coerce_ints(values: Any) -> list[int]:
-    out: list[int] = []
-    for value in values or []:
-        try:
-            out.append(int(str(value).strip()))
-        except (TypeError, ValueError):
-            continue
-    return out
+def _repair_json(s: str) -> str:
+    """Conserta os erros mais comuns do modelo antes do parse."""
+    # zero à esquerda em contexto numérico: [01, 04] -> [1, 4]
+    s = re.sub(r"(?<=[\[,\s])0+(\d)", r"\1", s)
+    # token com sufixo alfabético: 5a, 12o -> 5, 12
+    s = re.sub(r"(?<=[\[,\s])(\d+)[A-Za-zº°ª]+(?=[,\]\s])", r"\1", s)
+    # vírgula sobrando antes de fechar
+    s = re.sub(r",(\s*[\]}])", r"\1", s)
+    return s
 
 
-def _normalize(raw: dict[str, Any]) -> dict[str, Any]:
-    lottery_type = str(raw.get("lottery_type", "")).strip()
-    if lottery_type not in LOTTERY_TYPES:
-        lowered = lottery_type.lower()
-        if "mega" in lowered:
-            lottery_type = "Mega-Sena"
-        elif "quina" in lowered:
-            lottery_type = "Quina"
-        else:
-            raise ValueError(
-                f"lottery_type inesperado retornado pela IA: {lottery_type!r}"
-            )
-
+def _loads(content: str) -> dict[str, Any]:
+    stripped = _strip_json(content)
     try:
-        draw_number = int(str(raw.get("draw_number")).strip())
-    except (TypeError, ValueError) as exc:
-        raise ValueError("draw_number ausente ou inválido no retorno da IA") from exc
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return json.loads(_repair_json(stripped))
+
+
+def _to_int(value: Any) -> int | None:
+    match = re.search(r"\d+", str(value))
+    return int(match.group()) if match else None
+
+
+def _normalize_ticket(raw: dict[str, Any], index: int) -> dict[str, Any]:
+    warnings: list[str] = []
+
+    lottery_type = normalize_lottery_type(raw.get("lottery_type"))
+    if lottery_type is None:
+        warnings.append("Modalidade não reconhecida na leitura — selecione manualmente.")
+
+    draw_number = _to_int(raw.get("draw_number"))
+    if draw_number is None:
+        warnings.append("Concurso não reconhecido na leitura — informe manualmente.")
 
     games: list[dict[str, Any]] = []
-    for index, game in enumerate(raw.get("games") or []):
-        identifier = str(
-            game.get("identifier") or chr(ord("A") + index)
-        ).strip().upper()
-        numbers = sorted(set(_coerce_ints(game.get("numbers"))))
-        if numbers:
-            games.append({"identifier": identifier, "numbers": numbers})
+    for gi, raw_game in enumerate(raw.get("games") or []):
+        identifier = (
+            str(raw_game.get("identifier") or "").strip().upper()[:4]
+            or chr(ord("A") + gi)
+        )
+        numbers = clean_numbers(raw_game.get("numbers"))
+        games.append(
+            {
+                "identifier": identifier,
+                "numbers": sorted(numbers),
+                "warnings": validate_numbers(numbers, lottery_type),
+            }
+        )
 
     if not games:
-        raise ValueError("Nenhum jogo pôde ser extraído do bilhete")
+        warnings.append("Nenhuma aposta foi lida neste comprovante.")
 
     return {
         "lottery_type": lottery_type,
         "draw_number": draw_number,
         "games": games,
+        "warnings": warnings,
+        "source_index": index,
     }
 
 
-def extract_ticket(image_path: str | Path) -> dict[str, Any]:
-    """Lê um bilhete a partir da imagem salva e devolve os dados estruturados.
+def extract_tickets(image_path: str | Path) -> list[dict[str, Any]]:
+    """Lê todos os comprovantes de uma imagem.
 
-    Retorno::
+    Retorno: lista de dicts::
 
         {
-            "lottery_type": "Mega-Sena",
-            "draw_number": 2750,
-            "games": [{"identifier": "A", "numbers": [4, 10, 24, 36, 40, 54]}],
+          "lottery_type": "Mega-Sena" | None,
+          "draw_number": 3056 | None,
+          "games": [{"identifier": "A", "numbers": [...], "warnings": [...]}],
+          "warnings": [...],       # avisos no nível do comprovante
         }
     """
     path = Path(image_path)
@@ -132,23 +153,26 @@ def extract_ticket(image_path: str | Path) -> dict[str, Any]:
                 "role": "user",
                 "content": [
                     {"type": "text", "text": _EXTRACTION_PROMPT},
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": _image_data_url(path)},
-                    },
+                    {"type": "image_url", "image_url": {"url": _image_data_url(path)}},
                 ],
             }
         ],
         temperature=0.0,
-        max_tokens=1024,
+        max_tokens=2048,
     )
 
     content = response.choices[0].message.content or ""
     try:
-        raw = json.loads(_strip_json(content))
+        payload = _loads(content)
     except json.JSONDecodeError as exc:
         raise ValueError(
             f"Resposta da IA não é JSON válido: {content[:500]!r}"
         ) from exc
 
-    return _normalize(raw)
+    raw_tickets = payload.get("tickets")
+    if raw_tickets is None and "games" in payload:
+        raw_tickets = [payload]  # tolera o formato de comprovante único
+    if not isinstance(raw_tickets, list) or not raw_tickets:
+        raise ValueError(f"Nenhum comprovante identificado na leitura: {content[:500]!r}")
+
+    return [_normalize_ticket(t or {}, i) for i, t in enumerate(raw_tickets)]

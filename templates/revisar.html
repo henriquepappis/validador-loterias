@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% block title %}Revisar leitura — Validador de Loterias{% endblock %}
+
+{# --------------------------------------------------------------------- #}
+{% macro game_row(image_id, tkey, gkey, identifier='', numbers='') %}
+<div class="game-row grid grid-cols-[3.25rem_1fr] gap-2">
+  <input
+    name="image_{{ image_id }}_ticket_{{ tkey }}_game_{{ gkey }}_id"
+    value="{{ identifier }}" placeholder="A" maxlength="4"
+    class="rounded border border-slate-300 px-2 py-1 text-center text-sm uppercase" />
+  <input
+    name="image_{{ image_id }}_ticket_{{ tkey }}_game_{{ gkey }}_numbers"
+    value="{{ numbers }}" placeholder="ex: 4 10 24 36 40 54" inputmode="numeric"
+    class="rounded border border-slate-300 px-2 py-1 font-mono text-sm" />
+</div>
+{% endmacro %}
+
+{# --------------------------------------------------------------------- #}
+{% macro ticket_card(image_id, tkey, ticket, lottery_types) %}
+<fieldset class="ticket-card mt-3 rounded-lg border border-slate-200 p-4">
+  <div class="grid gap-3 sm:grid-cols-2">
+    <label class="text-sm">
+      <span class="mb-1 block text-slate-600">Modalidade</span>
+      <select
+        name="image_{{ image_id }}_ticket_{{ tkey }}_lottery"
+        class="w-full rounded border border-slate-300 px-2 py-1.5 text-sm">
+        <option value="">—</option>
+        {% for lt in lottery_types %}
+        <option value="{{ lt }}"
+          {% if ticket and ticket.lottery_type == lt %}selected{% endif %}>{{ lt }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="text-sm">
+      <span class="mb-1 block text-slate-600">Concurso</span>
+      <input
+        name="image_{{ image_id }}_ticket_{{ tkey }}_draw" type="text" inputmode="numeric"
+        value="{{ ticket.draw_number if ticket and ticket.draw_number is not none else '' }}"
+        class="w-full rounded border border-slate-300 px-2 py-1.5 text-sm" />
+    </label>
+  </div>
+
+  {% if ticket and ticket.notes %}
+  <p class="mt-2 rounded bg-amber-50 px-2 py-1 text-xs text-amber-700">⚠ {{ ticket.notes }}</p>
+  {% endif %}
+
+  <div class="mt-3">
+    <span class="text-xs uppercase tracking-wide text-slate-400">Apostas · identificador e dezenas</span>
+    <div class="games mt-1.5 space-y-2">
+      {% if ticket %}
+        {% for game in ticket.games %}
+        {{ game_row(image_id, tkey, 'g' ~ loop.index0, game.game_identifier, game.numbers | join(' ')) }}
+        {% endfor %}
+      {% endif %}
+      {{ game_row(image_id, tkey, 's0') }}
+      {{ game_row(image_id, tkey, 's1') }}
+    </div>
+    <button type="button" class="add-game mt-2 text-xs font-medium text-emerald-600"
+      data-image-id="{{ image_id }}" data-ticket-key="{{ tkey }}">+ aposta</button>
+  </div>
+</fieldset>
+{% endmacro %}
+
+{# --------------------------------------------------------------------- #}
+{% block content %}
+<div class="mx-auto max-w-3xl">
+  <h1 class="text-2xl font-bold text-slate-900">Revisar leitura</h1>
+  <p class="mt-1 text-sm text-slate-500">
+    Confira modalidade, concurso e dezenas de cada comprovante. Corrija o que a
+    IA errou, adicione comprovantes que faltaram e confirme para apurar.
+  </p>
+
+  {% if errors %}
+  <div class="mt-4 rounded-md border border-red-300 bg-red-50 px-4 py-3 text-sm text-red-700">
+    <p class="font-semibold">Ajuste os pontos abaixo — o lote não foi apurado:</p>
+    <ul class="mt-1 list-disc pl-5">
+      {% for e in errors %}<li>{{ e }}</li>{% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  <form method="post" action="/revisar/{{ batch.id }}" class="mt-6 space-y-6">
+    {% for image in batch.images %}
+    <section class="rounded-xl bg-white p-5 shadow-sm">
+      <div class="flex items-center justify-between">
+        <h2 class="text-sm font-semibold text-slate-700">Imagem #{{ image.id }}</h2>
+        <a href="/storage/{{ image.filename }}" target="_blank"
+           class="text-xs font-medium text-emerald-600 underline">ver foto</a>
+      </div>
+
+      <div class="tickets" id="tickets-{{ image.id }}">
+        {% for ticket in image.tickets %}
+        {{ ticket_card(image.id, ticket.id | string, ticket, lottery_types) }}
+        {% endfor %}
+        {{ ticket_card(image.id, 'n0', None, lottery_types) }}
+      </div>
+
+      <button type="button" class="add-ticket mt-3 text-sm font-medium text-emerald-600"
+        data-image-id="{{ image.id }}">+ comprovante</button>
+    </section>
+    {% endfor %}
+
+    <button type="submit"
+      class="w-full rounded-md bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-500">
+      Confirmar e apurar
+    </button>
+  </form>
+</div>
+
+<template id="ticket-tpl">{{ ticket_card('__IMG__', '__TK__', None, lottery_types) }}</template>
+<template id="game-tpl">{{ game_row('__IMG__', '__TK__', '__GK__') }}</template>
+
+<script>
+(function () {
+  let seq = 0;
+  document.addEventListener('click', function (ev) {
+    const addTicket = ev.target.closest('.add-ticket');
+    if (addTicket) {
+      const img = addTicket.dataset.imageId;
+      const html = document.getElementById('ticket-tpl').innerHTML
+        .split('__IMG__').join(img)
+        .split('__TK__').join('n' + (++seq));
+      const box = document.createElement('div');
+      box.innerHTML = html.trim();
+      document.getElementById('tickets-' + img).appendChild(box.firstElementChild);
+      return;
+    }
+    const addGame = ev.target.closest('.add-game');
+    if (addGame) {
+      const img = addGame.dataset.imageId;
+      const tk = addGame.dataset.ticketKey;
+      const html = document.getElementById('game-tpl').innerHTML
+        .split('__IMG__').join(img)
+        .split('__TK__').join(tk)
+        .split('__GK__').join('x' + (++seq));
+      const box = document.createElement('div');
+      box.innerHTML = html.trim();
+      addGame.previousElementSibling.appendChild(box.firstElementChild);
+    }
+  });
+})();
+</script>
+{% endblock %}
