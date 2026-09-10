@@ -1,0 +1,177 @@
+{% extends "base.html" %}
+{% block title %}Conferir recortes — Validador de Loterias{% endblock %}
+
+{% block content %}
+<style>
+  .editor { position: relative; display: block; width: 100%; touch-action: none; user-select: none; }
+  .editor img { display: block; width: 100%; height: auto; border-radius: .5rem; }
+  .editor.is-disabled .cbox { display: none; }
+  .cbox {
+    position: absolute; border: 2px solid #059669;
+    background: rgba(16, 185, 129, .14); box-shadow: 0 0 0 1px rgba(255,255,255,.6) inset;
+    cursor: move;
+  }
+  .cbox-label {
+    position: absolute; top: -1px; left: -1px; background: #059669; color: #fff;
+    font-size: 11px; font-weight: 700; padding: 1px 6px; border-radius: 0 0 6px 0;
+  }
+  .cbox-del {
+    position: absolute; top: -12px; right: -12px; width: 22px; height: 22px;
+    border-radius: 999px; border: 0; background: #dc2626; color: #fff;
+    font-size: 14px; line-height: 1; cursor: pointer;
+  }
+  .cbox-grip {
+    position: absolute; right: -8px; bottom: -8px; width: 16px; height: 16px;
+    background: #059669; border: 2px solid #fff; border-radius: 3px; cursor: nwse-resize;
+  }
+</style>
+
+<div class="mx-auto max-w-3xl">
+  <h1 class="text-2xl font-bold text-slate-900">Conferir recortes</h1>
+  <p class="mt-1 text-sm text-slate-500">
+    Cada retângulo é um bilhete que será lido. Arraste para mover, use a alça do
+    canto para redimensionar, o <span class="font-semibold text-red-600">×</span>
+    para remover, e <span class="font-semibold">+ recorte</span> para adicionar.
+    A leitura (OCR) só roda depois que você confirmar.
+  </p>
+
+  <form id="recortes-form" method="post" action="/recortes/{{ batch.id }}" class="mt-6 space-y-8">
+    {% for item in view %}
+    {% set o = item.original %}
+    <section class="rounded-xl bg-white p-4 shadow-sm">
+      <div class="mb-3 flex items-center justify-between">
+        <h2 class="text-sm font-semibold text-slate-700">Foto #{{ o.id }}</h2>
+        <label class="flex items-center gap-1.5 text-xs text-slate-600">
+          <input type="checkbox" name="whole_{{ o.id }}" value="1" class="toggle-whole"
+                 data-oid="{{ o.id }}" />
+          usar a foto inteira
+        </label>
+      </div>
+
+      <div class="editor" data-oid="{{ o.id }}" data-boxes='{{ item.boxes | tojson }}'>
+        <img src="/storage/{{ o.filename }}" alt="Foto {{ o.id }}" />
+      </div>
+
+      <button type="button" class="add-box mt-3 text-sm font-medium text-emerald-600"
+              data-oid="{{ o.id }}">+ recorte</button>
+      <input type="hidden" name="boxes_{{ o.id }}" value="[]" />
+    </section>
+    {% endfor %}
+
+    <button type="submit" id="recortes-submit"
+      class="flex w-full items-center justify-center gap-2 rounded-md bg-emerald-600
+             px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-emerald-500
+             disabled:cursor-not-allowed disabled:bg-emerald-600/70">
+      <svg id="recortes-spinner" class="hidden h-4 w-4 animate-spin" viewBox="0 0 24 24" fill="none">
+        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+        <path class="opacity-90" fill="currentColor" d="M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4z"></path>
+      </svg>
+      <span id="recortes-label">Confirmar recortes e ler</span>
+    </button>
+  </form>
+</div>
+
+<div id="recortes-overlay"
+  class="fixed inset-0 z-50 hidden flex-col items-center justify-center gap-4
+         bg-slate-900/60 backdrop-blur-sm">
+  <svg class="h-10 w-10 animate-spin text-white" viewBox="0 0 24 24" fill="none">
+    <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+    <path class="opacity-90" fill="currentColor" d="M4 12a8 8 0 0 1 8-8v4a4 4 0 0 0-4 4H4z"></path>
+  </svg>
+  <p class="text-sm font-medium text-white">Lendo os recortes com IA… pode levar até um minuto.</p>
+</div>
+
+<script>
+(function () {
+  function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+  document.querySelectorAll(".editor").forEach(function (editor) {
+    var oid = editor.dataset.oid;
+    var hidden = document.querySelector('input[name="boxes_' + oid + '"]');
+    var whole = document.querySelector('input[name="whole_' + oid + '"]');
+    var boxes = [];
+    try { boxes = JSON.parse(editor.dataset.boxes || "[]"); } catch (e) { boxes = []; }
+
+    function sync() {
+      hidden.value = JSON.stringify(boxes.map(function (b) {
+        return { x: +b[0].toFixed(4), y: +b[1].toFixed(4), w: +b[2].toFixed(4), h: +b[3].toFixed(4) };
+      }));
+    }
+    function nodes() { return editor.querySelectorAll(".cbox"); }
+    function place(node, b) {
+      node.style.left = (b[0] * 100) + "%"; node.style.top = (b[1] * 100) + "%";
+      node.style.width = (b[2] * 100) + "%"; node.style.height = (b[3] * 100) + "%";
+    }
+    function render() {
+      nodes().forEach(function (n) { n.remove(); });
+      boxes.forEach(function (b, i) {
+        var d = document.createElement("div");
+        d.className = "cbox";
+        d.innerHTML =
+          '<span class="cbox-label">' + (i + 1) + "</span>" +
+          '<button type="button" class="cbox-del" data-i="' + i + '">×</button>' +
+          '<span class="cbox-grip"></span>';
+        place(d, b);
+        editor.appendChild(d);
+      });
+      sync();
+    }
+
+    var drag = null;
+    editor.addEventListener("pointerdown", function (ev) {
+      var del = ev.target.closest(".cbox-del");
+      if (del) { boxes.splice(+del.dataset.i, 1); render(); return; }
+      var cbox = ev.target.closest(".cbox");
+      if (!cbox) return;
+      var list = Array.prototype.slice.call(nodes());
+      drag = {
+        i: list.indexOf(cbox),
+        mode: ev.target.classList.contains("cbox-grip") ? "resize" : "move",
+        px: ev.clientX, py: ev.clientY, box: boxes[list.indexOf(cbox)].slice(),
+      };
+      editor.setPointerCapture(ev.pointerId);
+      ev.preventDefault();
+    });
+    editor.addEventListener("pointermove", function (ev) {
+      if (!drag) return;
+      var r = editor.getBoundingClientRect();
+      var dx = (ev.clientX - drag.px) / r.width;
+      var dy = (ev.clientY - drag.py) / r.height;
+      var b = drag.box.slice();
+      if (drag.mode === "move") {
+        b[0] = clamp(b[0] + dx, 0, 1 - b[2]);
+        b[1] = clamp(b[1] + dy, 0, 1 - b[3]);
+      } else {
+        b[2] = clamp(b[2] + dx, 0.04, 1 - b[0]);
+        b[3] = clamp(b[3] + dy, 0.04, 1 - b[1]);
+      }
+      boxes[drag.i] = b;
+      place(nodes()[drag.i], b);
+      sync();
+    });
+    function endDrag() { drag = null; }
+    editor.addEventListener("pointerup", endDrag);
+    editor.addEventListener("pointercancel", endDrag);
+
+    document.querySelector('.add-box[data-oid="' + oid + '"]').addEventListener("click", function () {
+      boxes.push([0.34, 0.34, 0.32, 0.32]);
+      render();
+    });
+    whole.addEventListener("change", function () {
+      editor.classList.toggle("is-disabled", whole.checked);
+    });
+
+    render();
+  });
+
+  var form = document.getElementById("recortes-form");
+  form.addEventListener("submit", function () {
+    document.getElementById("recortes-spinner").classList.remove("hidden");
+    document.getElementById("recortes-label").textContent = "Lendo…";
+    document.getElementById("recortes-submit").disabled = true;
+    var ov = document.getElementById("recortes-overlay");
+    ov.classList.remove("hidden"); ov.classList.add("flex");
+  });
+})();
+</script>
+{% endblock %}

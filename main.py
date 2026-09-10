@@ -9,6 +9,7 @@ Fluxo:
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 import uuid
@@ -145,8 +146,8 @@ async def upload(
         (Path(f.filename or "").suffix.lower() or ".jpg", await f.read())
         for f in images
     ]
-    batch_id = await run_in_threadpool(_ingest_upload, db, payloads)
-    return RedirectResponse(url=f"/revisar/{batch_id}", status_code=303)
+    batch_id = await run_in_threadpool(_ingest_originals, db, payloads)
+    return RedirectResponse(url=f"/recortes/{batch_id}", status_code=303)
 
 
 _LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -181,43 +182,121 @@ def _group_tickets_by_modality(batch: Batch) -> list[dict[str, Any]]:
     ]
 
 
-def _ingest_upload(db: Session, payloads: list[tuple[str, bytes]]) -> int:
-    batch = Batch()
+def _save_crop(db: Session, batch_id: int, parent: Image, box, content: bytes):
+    crop_bytes = segmentation.crop_box(content, tuple(box))
+    filename = f"{uuid.uuid4().hex}.jpg"
+    (STORAGE_DIR / filename).write_bytes(crop_bytes)
+    crop = Image(
+        batch_id=batch_id,
+        filename=filename,
+        kind="crop",
+        parent_id=parent.id,
+        accepted=True,
+        box=[float(v) for v in box],
+    )
+    db.add(crop)
+    return crop
+
+
+def _ingest_originals(db: Session, payloads: list[tuple[str, bytes]]) -> int:
+    """Etapa 1: salva as fotos e propõe os recortes (sem OCR ainda)."""
+    batch = Batch(status="cropping")
     db.add(batch)
     db.flush()
 
     for suffix, content in payloads:
-        # Recorta cada bilhete da foto; cada recorte vira uma Image própria.
-        crops = segmentation.split_tickets(content)
-        for crop in crops:
-            crop_suffix = ".jpg" if len(crops) > 1 else (suffix or ".jpg")
-            filename = f"{uuid.uuid4().hex}{crop_suffix}"
-            (STORAGE_DIR / filename).write_bytes(crop)
+        filename = f"{uuid.uuid4().hex}{suffix or '.jpg'}"
+        (STORAGE_DIR / filename).write_bytes(content)
+        original = Image(
+            batch_id=batch.id, filename=filename, kind="original", accepted=True
+        )
+        db.add(original)
+        db.flush()
 
-            image = Image(batch_id=batch.id, filename=filename)
-            db.add(image)
-            db.flush()
-
-            try:
-                parsed_tickets = nim_vision.extract_tickets(STORAGE_DIR / filename)
-            except Exception as exc:  # noqa: BLE001 - falha de OCR não aborta o lote
-                logger.exception("OCR falhou para %s", filename)
-                db.add(
-                    Ticket(
-                        image_id=image.id,
-                        status="pending",
-                        notes=(
-                            f"Leitura automática falhou ({exc}). "
-                            "Preencha manualmente."
-                        ),
-                    )
-                )
-                continue
-
-            _persist_tickets(db, image, parsed_tickets)
+        boxes = segmentation.detect_boxes(content) or [(0.0, 0.0, 1.0, 1.0)]
+        for box in boxes:
+            _save_crop(db, batch.id, original, box, content)
 
     db.commit()
     return batch.id
+
+
+def _apply_recortes(
+    db: Session, batch_id: int, form: dict[str, str]
+) -> tuple[str, Any]:
+    """Etapa 2: regera os recortes a partir das caixas confirmadas e roda o OCR."""
+    batch = _load_batch(db, batch_id)
+    if batch is None:
+        return ("not_found", None)
+
+    originals = [im for im in batch.images if im.kind == "original"]
+    for original in originals:
+        raw = form.get(f"boxes_{original.id}", "")
+        if form.get(f"whole_{original.id}"):
+            rects = [(0.0, 0.0, 1.0, 1.0)]
+        else:
+            rects = _parse_boxes(raw)
+        if not rects:
+            continue  # mantém os recortes atuais deste original
+
+        content = (STORAGE_DIR / original.filename).read_bytes()
+        for crop in [im for im in batch.images if im.parent_id == original.id]:
+            (STORAGE_DIR / crop.filename).unlink(missing_ok=True)
+            db.delete(crop)
+        db.flush()
+        for box in rects:
+            _save_crop(db, batch.id, original, box, content)
+
+    db.flush()
+
+    # Consulta direta: a coleção batch.images pode estar defasada após os deletes.
+    crops = (
+        db.query(Image)
+        .filter(Image.batch_id == batch_id, Image.kind == "crop")
+        .order_by(Image.id)
+        .all()
+    )
+    for crop in crops:
+        if crop.tickets:
+            continue
+        try:
+            parsed = nim_vision.extract_tickets(STORAGE_DIR / crop.filename)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("OCR falhou para %s", crop.filename)
+            db.add(
+                Ticket(
+                    image_id=crop.id,
+                    status="pending",
+                    notes=(
+                        f"Leitura automática falhou ({type(exc).__name__}). "
+                        "Preencha manualmente."
+                    ),
+                )
+            )
+            continue
+        _persist_tickets(db, crop, parsed)
+
+    batch.status = "pending"
+    db.commit()
+    return ("ok", batch.id)
+
+
+def _parse_boxes(raw: str) -> list[tuple[float, float, float, float]]:
+    try:
+        items = json.loads(raw) if raw else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+    out: list[tuple[float, float, float, float]] = []
+    for item in items if isinstance(items, list) else []:
+        try:
+            x = min(max(float(item["x"]), 0.0), 1.0)
+            y = min(max(float(item["y"]), 0.0), 1.0)
+            w = min(max(float(item["w"]), 0.02), 1.0 - x)
+            h = min(max(float(item["h"]), 0.02), 1.0 - y)
+        except (KeyError, TypeError, ValueError):
+            continue
+        out.append((x, y, w, h))
+    return out
 
 
 def _persist_tickets(
@@ -277,13 +356,57 @@ def _persist_tickets(
 
 
 def _revisar_context(batch: Batch, errors: list[str]) -> dict[str, Any]:
+    crops = [im for im in batch.images if im.kind == "crop"]
+    anchor = crops[0].id if crops else (batch.images[0].id if batch.images else 0)
     return {
         "batch": batch,
         "groups": _group_tickets_by_modality(batch),
-        "anchor_image_id": batch.images[0].id if batch.images else 0,
+        "anchor_image_id": anchor,
         "lottery_types": LOTTERY_TYPES,
         "errors": errors,
     }
+
+
+@app.get("/recortes/{batch_id}", response_class=HTMLResponse)
+def recortes(request: Request, batch_id: int, db: Session = Depends(get_db)):
+    batch = _load_batch(db, batch_id)
+    if batch is None:
+        return templates.TemplateResponse(
+            request, "index.html", {"error": "Lote não encontrado."}, status_code=404
+        )
+    if batch.status != "cropping":
+        return RedirectResponse(url=f"/revisar/{batch_id}", status_code=303)
+
+    originals = [im for im in batch.images if im.kind == "original"]
+    view = [
+        {
+            "original": original,
+            "boxes": [
+                c.box or [0.0, 0.0, 1.0, 1.0]
+                for c in batch.images
+                if c.parent_id == original.id
+            ],
+        }
+        for original in originals
+    ]
+    return templates.TemplateResponse(
+        request, "recortes.html", {"batch": batch, "view": view}
+    )
+
+
+@app.post("/recortes/{batch_id}")
+async def recortes_submit(
+    request: Request, batch_id: int, db: Session = Depends(get_db)
+):
+    form = dict((await request.form()).multi_items())
+    outcome, data = await run_in_threadpool(
+        _apply_recortes, db, batch_id, form
+    )
+    if outcome == "not_found":
+        return templates.TemplateResponse(
+            request, "index.html", {"error": "Lote não encontrado."}, status_code=404
+        )
+    return RedirectResponse(url=f"/revisar/{data}", status_code=303)
 
 
 @app.get("/revisar/{batch_id}", response_class=HTMLResponse)
@@ -473,7 +596,21 @@ def historico(request: Request, db: Session = Depends(get_db)):
             ]
             confirmed_batches.append({"batch": batch, "groups": groups})
         if batch.status != "confirmed":
-            pending_batches.append(batch)
+            pending_batches.append(
+                {
+                    "batch": batch,
+                    "url": (
+                        f"/recortes/{batch.id}"
+                        if batch.status == "cropping"
+                        else f"/revisar/{batch.id}"
+                    ),
+                    "step": (
+                        "confirmar recortes"
+                        if batch.status == "cropping"
+                        else "revisar leitura"
+                    ),
+                }
+            )
 
     return templates.TemplateResponse(
         request,

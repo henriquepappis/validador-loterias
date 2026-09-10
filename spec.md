@@ -62,6 +62,7 @@ validador-loterias/
 ├── templates/
 │   ├── base.html            # Layout + navbar + Tailwind
 │   ├── index.html           # Upload de 1+ imagens
+│   ├── recortes.html        # Editor visual das caixas de recorte (antes do OCR)
 │   ├── revisar.html         # Revisão/edição das leituras antes de apurar
 │   └── historico.html       # Lotes confirmados (agrupados por imagem) + pendências
 ├── static/
@@ -80,20 +81,24 @@ migrations; em desenvolvimento, mudanças de schema exigem `drop_all` + `create_
 
 ### Tabela: `batches` (lote de upload)
 
-| Coluna       | Tipo                    | Observações                          |
-|--------------|-------------------------|-------------------------------------|
-| `id`         | SERIAL (PK)             |                                     |
-| `status`     | VARCHAR                 | `pending` \| `confirmed`             |
-| `created_at` | TIMESTAMP               |                                     |
+| Coluna       | Tipo                    | Observações                                       |
+|--------------|-------------------------|-------------------------------------------------|
+| `id`         | SERIAL (PK)             |                                                 |
+| `status`     | VARCHAR                 | `cropping` (confere recortes) \| `pending` (revisão) \| `confirmed` |
+| `created_at` | TIMESTAMP               |                                                 |
 
 ### Tabela: `images`
 
-| Coluna       | Tipo                    | Observações                          |
-|--------------|-------------------------|-------------------------------------|
-| `id`         | SERIAL (PK)             |                                     |
-| `batch_id`   | INTEGER (FK → batches)  | `ON DELETE CASCADE`                  |
-| `filename`   | VARCHAR (unique)        | Arquivo salvo em `storage/tickets/` |
-| `created_at` | TIMESTAMP               |                                     |
+| Coluna       | Tipo                    | Observações                              |
+|--------------|-------------------------|-----------------------------------------|
+| `id`         | SERIAL (PK)             |                                         |
+| `batch_id`   | INTEGER (FK → batches)  | `ON DELETE CASCADE`                      |
+| `filename`   | VARCHAR (unique)        | Arquivo salvo em `storage/tickets/`     |
+| `kind`       | VARCHAR                 | `original` (foto enviada) \| `crop`     |
+| `parent_id`  | INTEGER NULL (FK → images) | recorte → foto de origem             |
+| `accepted`   | BOOLEAN                 | recorte confirmado para leitura         |
+| `box`        | JSON NULL               | `[x, y, w, h]` normalizado na original   |
+| `created_at` | TIMESTAMP               |                                         |
 
 ### Tabela: `tickets` (um comprovante)
 
@@ -145,12 +150,16 @@ Restrição: `UNIQUE (lottery_type, draw_number)`.
 
 ### 5.2. Segmentação (`services/segmentation.py`)
 
-* `split_tickets(image_bytes)` → lista de bytes JPEG, um por bilhete detectado
-  (Otsu + `MORPH_CLOSE` + contornos externos filtrados por área/proporção +
-  `minAreaRect` + `warpPerspective` para corrigir inclinação; recortes pequenos
-  são ampliados). Sem separar ao menos 2 regiões, devolve `[imagem_original]`.
+* `detect_boxes(image_bytes)` → caixas normalizadas `(x, y, w, h)` de cada
+  bilhete, em ordem de leitura (Otsu + `MORPH_OPEN/CLOSE` + contornos filtrados
+  por área/proporção/preenchimento; blob alongado de 2–3 bilhetes é fatiado).
+  Vazio quando não separa ≥ 2 regiões.
+* `crop_box(image_bytes, box)` → JPEG de um recorte: corta a caixa, endireita o
+  papel (`minAreaRect` + `warpPerspective`), remove as faixas laterais da marca
+  d'água, aplica CLAHE + unsharp e amplia para `SEGMENTATION_UPSCALE_TO`.
+* `split_tickets` = atalho (detecta e recorta tudo).
 * Controlado por `SEGMENTATION_ENABLED`, `SEGMENTATION_MIN_AREA_FRAC`,
-  `SEGMENTATION_UPSCALE_TO`. Cada recorte vira uma linha em `images`.
+  `SEGMENTATION_UPSCALE_TO`.
 
 ### 5.3. Módulo de Leitura (`services/nim_vision.py`)
 
@@ -207,10 +216,18 @@ O trabalho bloqueante (OpenCV, NVIDIA NIM, scraper, ORM) roda via
 
 * **`GET /`** — upload com `input[type=file] multiple` (PNG/JPEG); ao enviar,
   overlay de "processando" que bloqueia o formulário.
-* **`POST /upload`** — para cada arquivo: `segmentation.split_tickets` recorta os
-  bilhetes (cada recorte → uma `Image`), roda `nim_vision.extract_tickets` por
-  recorte e grava `Ticket`s/`Game`s com `status = pending`. Falha de OCR num
-  recorte não aborta o lote. Redireciona para `/revisar/{batch_id}`.
+* **`POST /upload`** — salva cada foto como `Image(kind="original")`,
+  `segmentation.detect_boxes` propõe as caixas dos bilhetes (cada uma → um
+  `Image(kind="crop")` com `box`), **sem OCR ainda**. `batch.status = "cropping"`.
+  Redireciona para `/recortes/{batch_id}`.
+* **`GET /recortes/{batch_id}`** — editor visual: sobre cada foto original, as
+  caixas dos recortes podem ser movidas, redimensionadas, removidas e criadas;
+  há "usar a foto inteira" por foto. (Se o lote já saiu de `cropping`, redireciona
+  para `/revisar`.)
+* **`POST /recortes/{batch_id}`** — regera os recortes a partir das caixas
+  confirmadas (`segmentation.crop_box`), roda `nim_vision.extract_tickets` em cada
+  recorte, grava `Ticket`s/`Game`s (`_persist_tickets`). Falha de OCR num recorte
+  não aborta o lote. `batch.status = "pending"`. Redireciona para `/revisar`.
 * **`GET /revisar/{batch_id}`** — formulário agrupado por **modalidade**
   (Mega-Sena, Quina, Não identificado); dentro de cada grupo, um cartão por
   bilhete com suas apostas A, B, C… (contagem reinicia por bilhete) e link para

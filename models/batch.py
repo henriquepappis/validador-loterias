@@ -13,8 +13,10 @@ class Batch(Base):
     __tablename__ = "batches"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    # pending = aguardando revisão | confirmed = revisado e apurado
-    status: Mapped[str] = mapped_column(String, default="pending", nullable=False)
+    # cropping  = aguardando confirmação dos recortes
+    # pending   = recortes lidos, aguardando revisão
+    # confirmed = revisado e apurado
+    status: Mapped[str] = mapped_column(String, default="cropping", nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, nullable=False
     )

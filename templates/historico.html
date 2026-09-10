@@ -16,13 +16,14 @@
 
 {% if pending %}
 <div class="mt-4 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm">
-  <p class="font-medium text-amber-800">Revisões pendentes</p>
+  <p class="font-medium text-amber-800">Lotes em andamento</p>
   <ul class="mt-1 space-y-1">
-    {% for b in pending %}
+    {% for p in pending %}
     <li>
-      <a class="text-amber-800 underline" href="/revisar/{{ b.id }}">
-        Lote #{{ b.id }} — {{ b.created_at.strftime('%d/%m/%Y %H:%M') }}
+      <a class="text-amber-800 underline" href="{{ p.url }}">
+        Lote #{{ p.batch.id }} — {{ p.batch.created_at.strftime('%d/%m/%Y %H:%M') }}
       </a>
+      <span class="text-amber-700">· {{ p.step }}</span>
     </li>
     {% endfor %}
   </ul>
